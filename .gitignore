@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+agent.token
+agent.status
+agent.heartbeat
+agent.mode
+agent.log
+stop.flag
+inbox/
+outbox/
+probe.bin*
+output.log
+.env
+*.pem
+*.key
+*.crt

